@@ -70,27 +70,36 @@ pub enum ResolvedOptions {
 
 /// Configuration resolver that derives all config values from a single `serde_json::Value`.
 ///
-/// Priority order: `Oxfmtrc::default()` → `.editorconfig` → user's `.oxfmtrc`
+/// Priority order: `Oxfmtrc::default()` → user's `.oxfmtrc` base → `.oxfmtrc` overrides → `.editorconfig` (fallback)
 pub struct ConfigResolver {
+    /// Directory containing the config file (for relative path resolution in overrides).
+    config_dir: Option<PathBuf>,
     /// User's raw config as JSON value.
     /// It contains every possible field, even those not recognized by `Oxfmtrc`.
     /// e.g. `printWidth`: recognized by both `Oxfmtrc` and Prettier
     /// e.g. `vueIndentScriptAndStyle`: not recognized by `Oxfmtrc`, but used by Prettier
     /// e.g. `svelteSortAttributes`: not recognized by Prettier by default
     raw_config: Value,
+    /// Cached parsed options after validation.
+    /// Used to avoid re-parsing during per-file resolution, if no per-file overrides exist.
+    cached_options: Option<(OxfmtOptions, Value)>,
     /// Parsed `.editorconfig`, if any.
     editorconfig: Option<EditorConfig>,
-    /// Cached parsed options after validation.
-    /// Used to avoid re-parsing during per-file resolution, if `.editorconfig` is not used.
-    /// NOTE: Currently, only `.editorconfig` provides per-file overrides, `.oxfmtrc` does not.
-    cached_options: Option<(OxfmtOptions, Value)>,
+    /// Resolved overrides from `.oxfmtrc` for file-specific matching.
+    resolved_overrides: Vec<ResolvedOxfmtOverride>,
 }
 
 impl ConfigResolver {
     /// Create a new resolver from a raw JSON config value.
     #[cfg(feature = "napi")]
     pub fn from_value(raw_config: Value) -> Self {
-        Self { raw_config, editorconfig: None, cached_options: None }
+        Self {
+            config_dir: None,
+            raw_config,
+            cached_options: None,
+            editorconfig: None,
+            resolved_overrides: Vec::new(),
+        }
     }
 
     /// Create a resolver by loading config from a file path.
@@ -136,13 +145,21 @@ impl ConfigResolver {
             None => None,
         };
 
-        Ok(Self { raw_config, editorconfig, cached_options: None })
+        // Store the config directory for override path resolution
+        let config_dir = oxfmtrc_path.and_then(|p| p.parent().map(Path::to_path_buf));
+
+        Ok(Self {
+            config_dir,
+            raw_config,
+            cached_options: None,
+            editorconfig,
+            resolved_overrides: Vec::new(),
+        })
     }
 
     /// Validate config and return ignore patterns (= non-formatting option) for file walking.
     ///
     /// Validated options are cached for fast path resolution.
-    /// See also [`ConfigResolver::resolve_with_editorconfig_overrides`] for per-file overrides.
     ///
     /// # Errors
     /// Returns error if config deserialization fails.
@@ -150,6 +167,26 @@ impl ConfigResolver {
     pub fn build_and_validate(&mut self) -> Result<Vec<String>, String> {
         let oxfmtrc: Oxfmtrc = serde_json::from_value(self.raw_config.clone())
             .map_err(|err| format!("Failed to deserialize Oxfmtrc: {err}"))?;
+
+        // Resolve `overrides` from `Oxfmtrc` for later per-file matching
+        let base_dir = self.config_dir.take();
+        self.resolved_overrides = oxfmtrc
+            .overrides
+            .as_ref()
+            .map(|overrides| {
+                overrides
+                    .iter()
+                    .map(|o| ResolvedOxfmtOverride {
+                        files: GlobSet::new(o.files.clone(), base_dir.clone()),
+                        exclude_files: o
+                            .exclude_files
+                            .as_ref()
+                            .map(|ef| GlobSet::new(ef.clone(), base_dir.clone())),
+                        options: o.options.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut format_config = oxfmtrc.format_config;
 
@@ -185,19 +222,7 @@ impl ConfigResolver {
     /// Resolve format options for a specific file.
     #[instrument(level = "debug", name = "oxfmt::config::resolve", skip_all, fields(path = %strategy.path().display()))]
     pub fn resolve(&self, strategy: &FormatFileStrategy) -> ResolvedOptions {
-        let (oxfmt_options, external_options) = if let Some(editorconfig) = &self.editorconfig
-            && let Some(props) = get_editorconfig_overrides(editorconfig, strategy.path())
-        {
-            self.resolve_with_editorconfig_overrides(&props)
-        } else {
-            // Fast path: no per-file overrides
-            // Either:
-            // - `.editorconfig` is NOT used
-            // - or used but per-file overrides do NOT exist for this file
-            self.cached_options
-                .clone()
-                .expect("`build_and_validate()` must be called before `resolve()`")
-        };
+        let (oxfmt_options, external_options) = self.resolve_options(strategy.path());
 
         #[cfg(feature = "napi")]
         let OxfmtOptions { format_options, toml_options, sort_package_json, insert_final_newline } =
@@ -233,31 +258,104 @@ impl ConfigResolver {
         }
     }
 
-    /// Resolve format options for a specific file with `.editorconfig` overrides.
-    /// This is the slow path, for fast path, see [`ConfigResolver::build_and_validate`].
-    /// Also main logics are the same as in `build_and_validate()`.
-    #[instrument(level = "debug", name = "oxfmt::config::resolve_with_overrides", skip_all)]
-    fn resolve_with_editorconfig_overrides(
-        &self,
-        props: &EditorConfigProperties,
-    ) -> (OxfmtOptions, Value) {
-        // NOTE: Deserialize `FormatConfig` from `raw_config` (not from cached options).
-        // If we base it on cached options, root section may be already applied,
-        // so `.is_some()` checks won't work and per-file overrides may not be applied.
-        // And `props` already has root section applied.
-        let mut format_config: FormatConfig = serde_json::from_value(self.raw_config.clone())
-            .expect("`build_and_validate()` should catch this before `resolve()`");
+    /// Resolve options for a specific file path.
+    /// Priority: oxfmtrc base → oxfmtrc overrides → editorconfig (fallback for unset fields)
+    fn resolve_options(&self, path: &Path) -> (OxfmtOptions, Value) {
+        let editorconfig_overrides =
+            self.editorconfig.as_ref().and_then(|ec| get_editorconfig_overrides(ec, path));
+        let oxfmtrc_overrides: Vec<_> =
+            self.resolved_overrides.iter().filter(|o| o.is_match(path)).collect();
 
-        apply_editorconfig(&mut format_config, props);
+        // Fast path: no per-file overrides
+        if editorconfig_overrides.is_none() && oxfmtrc_overrides.is_empty() {
+            return self
+                .cached_options
+                .clone()
+                .expect("`build_and_validate()` must be called first");
+        }
+
+        // Slow path: reconstruct FormatConfig and apply overrides
+        let mut format_config: FormatConfig = serde_json::from_value(self.raw_config.clone())
+            .expect("`build_and_validate()` should catch this before");
+
+        // Apply oxfmtrc overrides first (explicit settings)
+        for r#override in &oxfmtrc_overrides {
+            format_config.merge(&r#override.options);
+        }
+
+        // Apply editorconfig as fallback (fills in unset fields only)
+        if let Some(props) = &editorconfig_overrides {
+            apply_editorconfig(&mut format_config, props);
+        }
 
         let oxfmt_options = format_config
             .into_oxfmt_options()
-            .expect("If this fails, there is an issue with editorconfig insertion above");
+            .expect("If this fails, there is an issue with override values");
 
         let mut external_options = self.raw_config.clone();
         populate_prettier_config(&oxfmt_options.format_options, &mut external_options);
 
         (oxfmt_options, external_options)
+    }
+}
+
+// ---
+
+/// Resolved override with compiled glob patterns.
+/// Used internally for efficient file matching.
+#[derive(Debug, Clone)]
+struct ResolvedOxfmtOverride {
+    files: GlobSet,
+    exclude_files: Option<GlobSet>,
+    options: FormatConfig,
+}
+
+impl ResolvedOxfmtOverride {
+    fn is_match(&self, path: &Path) -> bool {
+        self.files.is_match(path) && self.exclude_files.as_ref().is_none_or(|ex| !ex.is_match(path))
+    }
+}
+
+/// A set of glob patterns for file matching.
+/// Automatically adds `**/` prefix to patterns without `/` for ESLint/Prettier compatibility.
+#[derive(Debug, Default, Clone)]
+struct GlobSet {
+    patterns: Vec<String>,
+    base_dir: Option<PathBuf>,
+}
+
+impl GlobSet {
+    fn new<S: AsRef<str>, I: IntoIterator<Item = S>>(
+        patterns: I,
+        base_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            patterns: patterns
+                .into_iter()
+                .map(|pat| {
+                    let pattern = pat.as_ref();
+                    if pattern.contains('/') {
+                        pattern.to_owned()
+                    } else {
+                        // Add **/ prefix for patterns without path separators.
+                        // This matches ESLint/Prettier behavior.
+                        format!("**/{pattern}")
+                    }
+                })
+                .collect(),
+            base_dir,
+        }
+    }
+
+    fn is_match(&self, path: &Path) -> bool {
+        let relative = self
+            .base_dir
+            .as_ref()
+            .and_then(|dir| path.strip_prefix(dir).ok())
+            .unwrap_or(path)
+            .to_string_lossy();
+
+        self.patterns.iter().any(|glob| fast_glob::glob_match(glob, relative.as_ref()))
     }
 }
 

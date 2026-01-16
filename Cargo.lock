@@ -2502,6 +2502,7 @@ dependencies = [
  "bpaf",
  "cow-utils",
  "editorconfig-parser",
+ "fast-glob",
  "ignore",
  "json-strip-comments",
  "mimalloc-safe",
