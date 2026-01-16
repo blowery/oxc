@@ -1,4 +1,4 @@
-ts compatibility: 584/606 (96.37%)
+ts compatibility: 585/606 (96.53%)
 
 # Failed
 
@@ -19,7 +19,6 @@ ts compatibility: 584/606 (96.37%)
 | typescript/intersection/consistent-with-flow/intersection-parens.ts | 💥 | 69.77% |
 | typescript/last-argument-expansion/decorated-function.tsx | 💥 | 29.06% |
 | typescript/mapped-type/issue-11098.ts | 💥 | 97.03% |
-| typescript/mapped-type/break-mode/break-mode.ts | 💥 | 68.75% |
 | typescript/property-signature/consistent-with-flow/comments.ts | 💥 | 80.00% |
 | typescript/union/union-parens.ts | 💥 | 92.59% |
 | typescript/union/comments/18106.ts | 💥 | 92.68% |
