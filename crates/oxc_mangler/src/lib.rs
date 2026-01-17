@@ -4,7 +4,7 @@ use itertools::Itertools;
 use keep_names::collect_name_symbols;
 use oxc_index::IndexVec;
 use oxc_syntax::class::ClassId;
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use base54::base54;
 use oxc_allocator::{Allocator, BitSet, Vec};
@@ -534,10 +534,11 @@ impl<'t> Mangler<'t> {
         let root_scope_id = scoping.root_scope_id();
         let temp_allocator = self.temp_allocator.as_ref();
 
-        // Use a sparse approach: only track slots that have symbols.
-        // This avoids creating empty SlotFrequency entries for unused slots.
-        let mut slot_data: FxHashMap<Slot, (usize, Vec<'a, SymbolId>)> =
-            FxHashMap::with_capacity_and_hasher(total_number_of_slots, FxBuildHasher);
+        // Use Vec for O(1) indexing during the loop, then filter out empty slots.
+        let mut frequencies = Vec::from_iter_in(
+            iter::repeat_with(|| SlotFrequency::new(temp_allocator)).take(total_number_of_slots),
+            temp_allocator,
+        );
 
         for (symbol_id, &slot) in slots.iter().enumerate() {
             let symbol_id = SymbolId::from_usize(symbol_id);
@@ -556,18 +557,15 @@ impl<'t> Mangler<'t> {
             if keep_name_symbols.contains(&symbol_id) {
                 continue;
             }
-            let ref_count = scoping.get_resolved_reference_ids(symbol_id).len();
-            let entry = slot_data.entry(slot).or_insert_with(|| (0, Vec::new_in(temp_allocator)));
-            entry.0 += ref_count;
-            entry.1.push(symbol_id);
+            let index = slot as usize;
+            frequencies[index].slot = slot;
+            frequencies[index].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
+            frequencies[index].symbol_ids.push(symbol_id);
         }
 
-        // Convert to Vec and sort by frequency (descending), then by slot (ascending)
+        // Remove empty slots and sort by frequency (descending), then by slot (ascending)
         // for deterministic ordering when frequencies are equal
-        let mut frequencies = Vec::with_capacity_in(slot_data.len(), temp_allocator);
-        for (slot, (frequency, symbol_ids)) in slot_data {
-            frequencies.push(SlotFrequency { slot, frequency, symbol_ids });
-        }
+        frequencies.retain(|f| !f.symbol_ids.is_empty());
         frequencies.sort_unstable_by(|a, b| {
             b.frequency.cmp(&a.frequency).then_with(|| a.slot.cmp(&b.slot))
         });
@@ -678,6 +676,12 @@ struct SlotFrequency<'a> {
     slot: Slot,
     frequency: usize,
     symbol_ids: Vec<'a, SymbolId>,
+}
+
+impl<'a> SlotFrequency<'a> {
+    fn new(allocator: &'a Allocator) -> Self {
+        Self { slot: 0, frequency: 0, symbol_ids: Vec::new_in(allocator) }
+    }
 }
 
 // Maximum length of string is 15 (`slot_4294967295` for `u32::MAX`).
