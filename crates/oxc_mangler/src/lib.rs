@@ -534,11 +534,11 @@ impl<'t> Mangler<'t> {
         let root_scope_id = scoping.root_scope_id();
         let temp_allocator = self.temp_allocator.as_ref();
 
-        // Use Vec for O(1) indexing during the loop, then filter out empty slots.
-        let mut frequencies = Vec::from_iter_in(
-            iter::repeat_with(|| SlotFrequency::new(temp_allocator)).take(total_number_of_slots),
-            temp_allocator,
-        );
+        // Map slot -> index in frequencies vec (only for non-empty slots)
+        let mut slot_to_index =
+            Vec::from_iter_in(iter::repeat_n(u32::MAX, total_number_of_slots), temp_allocator);
+        // Pre-reserve with upper bound
+        let mut frequencies = Vec::with_capacity_in(total_number_of_slots, temp_allocator);
 
         for (symbol_id, &slot) in slots.iter().enumerate() {
             let symbol_id = SymbolId::from_usize(symbol_id);
@@ -557,16 +557,26 @@ impl<'t> Mangler<'t> {
             if keep_name_symbols.contains(&symbol_id) {
                 continue;
             }
-            let index = slot as usize;
-            frequencies[index].slot = slot;
-            frequencies[index].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
-            frequencies[index].symbol_ids.push(symbol_id);
+            let slot_idx = slot as usize;
+            let freq_idx = if slot_to_index[slot_idx] == u32::MAX {
+                let idx = frequencies.len();
+                slot_to_index[slot_idx] = idx as u32;
+                frequencies.push(SlotFrequency {
+                    slot,
+                    frequency: 0,
+                    symbol_ids: Vec::new_in(temp_allocator),
+                });
+                idx
+            } else {
+                slot_to_index[slot_idx] as usize
+            };
+
+            frequencies[freq_idx].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
+            frequencies[freq_idx].symbol_ids.push(symbol_id);
         }
 
-        // Remove empty slots and sort by frequency (descending), then by slot (ascending)
-        // for deterministic ordering when frequencies are equal
-        frequencies.retain(|f| !f.symbol_ids.is_empty());
         frequencies.sort_unstable_by_key(|x| (std::cmp::Reverse(x.frequency), x.slot));
+
         frequencies
     }
 
