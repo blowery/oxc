@@ -1,10 +1,10 @@
-use std::iter::{self, repeat_with};
+use std::iter;
 
 use itertools::Itertools;
 use keep_names::collect_name_symbols;
 use oxc_index::IndexVec;
 use oxc_syntax::class::ClassId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
 use base54::base54;
 use oxc_allocator::{Allocator, BitSet, Vec};
@@ -266,8 +266,7 @@ impl<'t> Mangler<'t> {
     /// Pass the symbol table to oxc_codegen to generate the mangled code.
     #[must_use]
     pub fn build(self, program: &Program<'_>) -> ManglerReturn {
-        let mut semantic =
-            SemanticBuilder::new().with_scope_tree_child_ids(true).build(program).semantic;
+        let mut semantic = SemanticBuilder::new().build(program).semantic;
         let class_private_mappings = self.build_with_semantic(&mut semantic, program);
         ManglerReturn { scoping: semantic.into_scoping(), class_private_mappings }
     }
@@ -297,8 +296,6 @@ impl<'t> Mangler<'t> {
     ) {
         let (scoping, ast_nodes) = semantic.scoping_mut_and_nodes();
 
-        assert!(scoping.has_scope_child_ids(), "child_id needs to be generated");
-
         let (exported_names, exported_symbols) = if self.options.top_level {
             Mangler::collect_exported_symbols(program)
         } else {
@@ -308,6 +305,7 @@ impl<'t> Mangler<'t> {
             Mangler::collect_keep_name_symbols(self.options.keep_names, scoping, ast_nodes);
 
         let temp_allocator = self.temp_allocator.as_ref();
+        let scopes_len = scoping.scopes_len();
 
         // All symbols with their assigned slots. Keyed by symbol id.
         let mut slots = Vec::from_iter_in(iter::repeat_n(0, scoping.symbols_len()), temp_allocator);
@@ -320,7 +318,7 @@ impl<'t> Mangler<'t> {
 
         let mut reusable_slots = Vec::new_in(temp_allocator);
         // Pre-computed BitSet for ancestor membership tests - reused across iterations
-        let mut ancestor_set = BitSet::new_in(scoping.scopes_len(), temp_allocator);
+        let mut ancestor_set = BitSet::new_in(scopes_len, temp_allocator);
         // Walk down the scope tree and assign a slot number for each symbol.
         // It is possible to do this in a loop over the symbol list,
         // but walking down the scope tree seems to generate a better code.
@@ -343,24 +341,24 @@ impl<'t> Mangler<'t> {
             tmp_bindings.sort_unstable();
 
             let mut slot = slot_liveness.len();
+            let needed_slots = tmp_bindings.len();
 
+            // Find reusable slots: slots that are not blocked at the current scope.
+            // Use a direct loop with early exit for efficiency.
             reusable_slots.clear();
-            reusable_slots.extend(
-                // Slots that are already assigned to other symbols, but does not live in the current scope.
-                slot_liveness
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, slot_liveness)| !slot_liveness.has_bit(scope_id.index()))
-                    .map(
-                        // `slot_liveness` is an arena `Vec`, so its indexes cannot exceed `u32::MAX`
-                        #[expect(clippy::cast_possible_truncation)]
-                        |(slot, _)| slot as Slot,
-                    )
-                    .take(tmp_bindings.len()),
-            );
+            let scope_idx = scope_id.index();
+            for (slot_idx, liveness) in slot_liveness.iter().enumerate() {
+                if reusable_slots.len() >= needed_slots {
+                    break;
+                }
+                if !liveness.has_bit(scope_idx) {
+                    #[expect(clippy::cast_possible_truncation)]
+                    reusable_slots.push(slot_idx as Slot);
+                }
+            }
 
             // The number of new slots that needs to be allocated.
-            let remaining_count = tmp_bindings.len() - reusable_slots.len();
+            let remaining_count = needed_slots - reusable_slots.len();
             // There cannot be more slots than there are symbols, and `SymbolId` is a `u32`,
             // so truncation is not possible here
             #[expect(clippy::cast_possible_truncation)]
@@ -369,7 +367,7 @@ impl<'t> Mangler<'t> {
             slot += remaining_count;
             if slot_liveness.len() < slot {
                 slot_liveness.extend(
-                    iter::repeat_with(|| BitSet::new_in(scoping.scopes_len(), temp_allocator))
+                    iter::repeat_with(|| BitSet::new_in(scopes_len, temp_allocator))
                         .take(remaining_count),
                 );
             }
@@ -381,7 +379,6 @@ impl<'t> Mangler<'t> {
                 ancestor_set.set_bit(ancestor_id.index());
             }
 
-            let scope_id_index = scope_id.index();
             for (&symbol_id, &assigned_slot) in tmp_bindings.iter().zip(&reusable_slots) {
                 slots[symbol_id.index()] = assigned_slot;
 
@@ -410,8 +407,7 @@ impl<'t> Mangler<'t> {
                     for ancestor_id in scoping.scope_ancestors(used_scope_id) {
                         let ancestor_index = ancestor_id.index();
                         // Stop when we reach scope_id or any of its ancestors
-                        if ancestor_index == scope_id_index || ancestor_set.has_bit(ancestor_index)
-                        {
+                        if ancestor_index == scope_idx || ancestor_set.has_bit(ancestor_index) {
                             break;
                         }
                         if slot_liveness_bitset.has_bit(ancestor_index) {
@@ -419,7 +415,7 @@ impl<'t> Mangler<'t> {
                                 scoping.scope_ancestors(ancestor_id).skip(1).all(|a| {
                                     let idx = a.index();
                                     slot_liveness_bitset.has_bit(idx)
-                                        || idx == scope_id_index
+                                        || idx == scope_idx
                                         || ancestor_set.has_bit(idx)
                                 }),
                                 "Invariant violated: ancestor chain should be fully marked live"
@@ -445,10 +441,13 @@ impl<'t> Mangler<'t> {
         let root_unresolved_references = scoping.root_unresolved_references();
         let root_bindings = scoping.get_bindings(scoping.root_scope_id());
 
-        let mut reserved_names = Vec::with_capacity_in(total_number_of_slots, temp_allocator);
+        // Generate reserved names only for slots that have symbols (frequencies.len())
+        // instead of all slots. This avoids generating unused names.
+        let names_needed = frequencies.len();
+        let mut reserved_names = Vec::with_capacity_in(names_needed, temp_allocator);
 
         let mut count = 0;
-        for _ in 0..total_number_of_slots {
+        for _ in 0..names_needed {
             let name = loop {
                 let name = generate_name(count);
                 count += 1;
@@ -534,12 +533,13 @@ impl<'t> Mangler<'t> {
     ) -> Vec<'a, SlotFrequency<'a>> {
         let root_scope_id = scoping.root_scope_id();
         let temp_allocator = self.temp_allocator.as_ref();
-        let mut frequencies = Vec::from_iter_in(
-            repeat_with(|| SlotFrequency::new(temp_allocator)).take(total_number_of_slots),
-            temp_allocator,
-        );
 
-        for (symbol_id, slot) in slots.iter().copied().enumerate() {
+        // Use a sparse approach: only track slots that have symbols.
+        // This avoids creating empty SlotFrequency entries for unused slots.
+        let mut slot_data: FxHashMap<Slot, (usize, Vec<'a, SymbolId>)> =
+            FxHashMap::with_capacity_and_hasher(total_number_of_slots, FxBuildHasher);
+
+        for (symbol_id, &slot) in slots.iter().enumerate() {
             let symbol_id = SymbolId::from_usize(symbol_id);
             let symbol_scope_id = scoping.symbol_scope_id(symbol_id);
             if symbol_scope_id == root_scope_id
@@ -556,12 +556,21 @@ impl<'t> Mangler<'t> {
             if keep_name_symbols.contains(&symbol_id) {
                 continue;
             }
-            let index = slot as usize;
-            frequencies[index].slot = slot;
-            frequencies[index].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
-            frequencies[index].symbol_ids.push(symbol_id);
+            let ref_count = scoping.get_resolved_reference_ids(symbol_id).len();
+            let entry = slot_data.entry(slot).or_insert_with(|| (0, Vec::new_in(temp_allocator)));
+            entry.0 += ref_count;
+            entry.1.push(symbol_id);
         }
-        frequencies.sort_unstable_by_key(|x| std::cmp::Reverse(x.frequency));
+
+        // Convert to Vec and sort by frequency (descending), then by slot (ascending)
+        // for deterministic ordering when frequencies are equal
+        let mut frequencies = Vec::with_capacity_in(slot_data.len(), temp_allocator);
+        for (slot, (frequency, symbol_ids)) in slot_data {
+            frequencies.push(SlotFrequency { slot, frequency, symbol_ids });
+        }
+        frequencies.sort_unstable_by(|a, b| {
+            b.frequency.cmp(&a.frequency).then_with(|| a.slot.cmp(&b.slot))
+        });
         frequencies
     }
 
@@ -666,15 +675,9 @@ fn is_special_name(name: &str) -> bool {
 
 #[derive(Debug)]
 struct SlotFrequency<'a> {
-    pub slot: Slot,
-    pub frequency: usize,
-    pub symbol_ids: Vec<'a, SymbolId>,
-}
-
-impl<'t> SlotFrequency<'t> {
-    fn new(temp_allocator: &'t Allocator) -> Self {
-        Self { slot: 0, frequency: 0, symbol_ids: Vec::new_in(temp_allocator) }
-    }
+    slot: Slot,
+    frequency: usize,
+    symbol_ids: Vec<'a, SymbolId>,
 }
 
 // Maximum length of string is 15 (`slot_4294967295` for `u32::MAX`).
