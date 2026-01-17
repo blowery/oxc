@@ -566,9 +566,7 @@ impl<'t> Mangler<'t> {
         // Remove empty slots and sort by frequency (descending), then by slot (ascending)
         // for deterministic ordering when frequencies are equal
         frequencies.retain(|f| !f.symbol_ids.is_empty());
-        frequencies.sort_unstable_by(|a, b| {
-            b.frequency.cmp(&a.frequency).then_with(|| a.slot.cmp(&b.slot))
-        });
+        frequencies.sort_unstable_by_key(|x| (std::cmp::Reverse(x.frequency), x.slot));
         frequencies
     }
 
