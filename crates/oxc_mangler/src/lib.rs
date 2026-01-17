@@ -538,7 +538,7 @@ impl<'t> Mangler<'t> {
         let mut slot_to_index =
             Vec::from_iter_in(iter::repeat_n(u32::MAX, total_number_of_slots), temp_allocator);
         // Pre-reserve with upper bound
-        let mut frequencies = Vec::with_capacity_in(total_number_of_slots, temp_allocator);
+        let mut frequencies = Vec::with_capacity_in(total_number_of_slots / 2, temp_allocator);
 
         for (symbol_id, &slot) in slots.iter().enumerate() {
             let symbol_id = SymbolId::from_usize(symbol_id);
@@ -574,9 +574,7 @@ impl<'t> Mangler<'t> {
             frequencies[freq_idx].frequency += scoping.get_resolved_reference_ids(symbol_id).len();
             frequencies[freq_idx].symbol_ids.push(symbol_id);
         }
-
-        frequencies.sort_unstable_by_key(|x| (std::cmp::Reverse(x.frequency), x.slot));
-
+        frequencies.sort_unstable_by_key(|x| std::cmp::Reverse(x.frequency));
         frequencies
     }
 
